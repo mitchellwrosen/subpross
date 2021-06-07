@@ -1,5 +1,6 @@
 cabal-version: 2.4
 
+-- TODO rename to indicate this is unix-only
 name: subpross
 version: 0
 
@@ -9,7 +10,16 @@ library
     bytestring,
     ki,
     process,
+    stm,
     text,
+    unix,
+  default-extensions:
+    BlockArguments
+    DeriveGeneric
+    DerivingStrategies
+    LambdaCase
+    ScopedTypeVariables
+    TypeApplications
   default-language: Haskell2010
   exposed-modules: Subpross
   ghc-options: -Wall
