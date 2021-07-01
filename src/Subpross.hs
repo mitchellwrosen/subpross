@@ -14,6 +14,7 @@ import Data.Foldable (for_)
 import Data.Function
 import Data.Functor (void)
 import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Maybe (catMaybes)
 import Data.Void (Void)
 import GHC.Generics (Generic)
 import qualified Ki
@@ -38,7 +39,7 @@ data Event a
 
 withProcess :: Source ByteString -> Process.CreateProcess -> (Source (Event ByteString) -> IO r) -> IO r
 withProcess stdin createProcess k =
-  bracket (Process.createProcess createProcess) cleanup \process -> do
+  bracket (Process.createProcess createProcess) cleanupProcess \process -> do
     (readEvent, writeEvent) <- newQueue
     Ki.scoped \scope -> do
       Ki.fork_ scope (handleRunningProcess stdin process (atomically . writeEvent))
@@ -50,23 +51,29 @@ withProcess stdin createProcess k =
             Stdout _ -> again
             Stderr _ -> again
             Exit _ -> callback Nothing
+
+cleanupProcess :: RunningProcess -> IO ()
+cleanupProcess (maybeStdin, maybeStdout, maybeStderr, process) =
+  case catMaybes [maybeStdin, maybeStdout, maybeStderr] of
+    [] -> terminate
+    handles -> terminate `finally` closeHandles1 handles
   where
-    cleanup :: RunningProcess -> IO ()
-    cleanup (maybeStdin, maybeStdout, maybeStderr, process) =
-      void @_ @ExitCode terminate `finally` closeHandles
-      where
-        closeHandles :: IO ()
-        closeHandles =
-          for_ maybeStdin hClose `finally` for_ maybeStdout hClose `finally` for_ maybeStderr hClose
-        terminate :: IO ExitCode
-        terminate = do
-          Process.withProcessHandle process \case
-            Process.ClosedHandle _ -> pure ()
-            Process.OpenExtHandle {} -> undefined -- bug "OpenExtHandle is Windows-only" []
-            Process.OpenHandle pid -> do
-              pgid <- Posix.getProcessGroupIDOf pid
-              Posix.signalProcessGroup Posix.sigTERM pgid
-          Process.waitForProcess process
+    terminate :: IO ()
+    terminate = do
+      Process.withProcessHandle process \case
+        Process.ClosedHandle _ -> pure ()
+        Process.OpenExtHandle {} -> undefined -- bug "OpenExtHandle is Windows-only" []
+        Process.OpenHandle pid -> do
+          pgid <- Posix.getProcessGroupIDOf pid
+          Posix.signalProcessGroup Posix.sigTERM pgid
+      void (Process.waitForProcess process)
+
+-- | Close a non-empty list of handles.
+closeHandles1 :: [Handle] -> IO ()
+closeHandles1 = \case
+  [] -> undefined
+  [x] -> hClose x
+  x : xs -> hClose x `finally` closeHandles1 xs
 
 handleRunningProcess :: Source ByteString -> RunningProcess -> (Event ByteString -> IO ()) -> IO ()
 handleRunningProcess stdin (maybeStdin, maybeStdout, maybeStderr, process) handleEvent =
