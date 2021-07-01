@@ -15,9 +15,12 @@ library
     unix,
   default-extensions:
     BlockArguments
+    DataKinds
     DeriveGeneric
     DerivingStrategies
+    KindSignatures
     LambdaCase
+    NamedFieldPuns
     ScopedTypeVariables
     TypeApplications
   default-language: Haskell2010
