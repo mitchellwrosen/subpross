@@ -70,63 +70,36 @@ withProcess Config {arguments, foreground, name} stdin k =
         bracket
           (fourth <$> Process.createProcess createProcess)
           terminateProcess
-          \process -> do
-            eventQueue <- newTQueueIO
-            Ki.scoped \scope -> do
-              Ki.fork_ scope do
-                handleProcess stdinW stdoutR stderrR process stdin (atomically . writeTQueue eventQueue)
-              k \callback _ ->
-                fix \again -> do
-                  event <- atomically (readTQueue eventQueue)
-                  callback (Just event)
-                  case event of
-                    Stdout _ -> again
-                    Stderr _ -> again
-                    Exit _ -> callback Nothing
+          (handleProcess stdin k stdinW stdoutR stderrR)
   where
     fourth :: (a, b, c, d) -> d
     fourth (_, _, _, x) =
       x
 
-terminateProcess :: Process.ProcessHandle -> IO ()
-terminateProcess process =
-  getProcessId process >>= \case
-    Nothing -> pure ()
-    Just pid ->
-      try (Posix.getProcessGroupIDOf pid) >>= \case
-        Left (_ :: IOException) -> pure ()
-        Right pgid ->
-          try (Posix.signalProcessGroup Posix.sigTERM pgid) >>= \case
-            Left (_ :: IOException) -> pure ()
-            Right () -> void (Process.waitForProcess process)
-
-getProcessId :: Process.ProcessHandle -> IO (Maybe Posix.CPid)
-getProcessId process =
-  Process.modifyProcessHandle process \handle ->
-    pure
-      ( handle,
-        case handle of
-          Process.ClosedHandle {} -> Nothing
-          Process.OpenExtHandle {} -> Nothing
-          Process.OpenHandle pid -> Just pid
-      )
-
 handleProcess ::
+  Pipe Void ByteString ->
+  (Pipe Void (Event ByteString ByteString) -> IO r) ->
   H "w" ->
   H "r" ->
   H "r" ->
   Process.ProcessHandle ->
-  Pipe Void ByteString ->
-  (Event ByteString ByteString -> IO ()) ->
-  IO ()
-handleProcess stdinW stdoutR stderrR process stdin handleEvent =
+  IO r
+handleProcess stdin k stdinW stdoutR stderrR process = do
+  eventQueue <- newTQueueIO
+  let write = atomically . writeTQueue eventQueue
   Ki.scoped \scope -> do
     Ki.fork_ scope (handleInput stdinW)
-    Ki.fork_ scope (handleOutput stdoutR (handleEvent . Stdout))
-    Ki.fork_ scope (handleOutput stderrR (handleEvent . Stderr))
-    exitCode <- Process.waitForProcess process
-    handleEvent (Exit exitCode)
-    Ki.wait scope
+    Ki.fork_ scope (handleOutput stdoutR (write . Stdout))
+    Ki.fork_ scope (handleOutput stderrR (write . Stderr))
+    Ki.fork_ scope (Process.waitForProcess process >>= write . Exit)
+    k \callback _ ->
+      fix \again -> do
+        event <- atomically (readTQueue eventQueue)
+        callback (Just event)
+        case event of
+          Stdout _ -> again
+          Stderr _ -> again
+          Exit _ -> callback Nothing
   where
     handleInput :: H "w" -> IO ()
     handleInput handle = do
@@ -150,3 +123,26 @@ handleProcess stdinW stdoutR stderrR process stdin handleEvent =
           else do
             action chunk
             again
+
+terminateProcess :: Process.ProcessHandle -> IO ()
+terminateProcess process =
+  getProcessId process >>= \case
+    Nothing -> pure ()
+    Just pid ->
+      try (Posix.getProcessGroupIDOf pid) >>= \case
+        Left (_ :: IOException) -> pure ()
+        Right pgid ->
+          try (Posix.signalProcessGroup Posix.sigTERM pgid) >>= \case
+            Left (_ :: IOException) -> pure ()
+            Right () -> void (Process.waitForProcess process)
+
+getProcessId :: Process.ProcessHandle -> IO (Maybe Posix.CPid)
+getProcessId process =
+  Process.modifyProcessHandle process \handle ->
+    pure
+      ( handle,
+        case handle of
+          Process.ClosedHandle {} -> Nothing
+          Process.OpenExtHandle {} -> Nothing
+          Process.OpenHandle pid -> Just pid
+      )
