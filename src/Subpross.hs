@@ -2,10 +2,8 @@
 
 module Subpross
   ( withProcess,
-    Config (..),
+    Spec (..),
     Event (..),
-    asStdout,
-    asStderr,
   )
 where
 
@@ -33,18 +31,18 @@ import qualified System.Process.Internals as Process
 import Prelude hiding (lines)
 
 -- TODO cwd, env
-data Config = Config
+data Spec = Spec
   { name :: Text,
     arguments :: [Text],
     foreground :: Bool
   }
 
 withProcess ::
-  Config ->
+  Spec ->
   Pipe Void ByteString ->
   (Pipe Void (Event ByteString ByteString) -> IO r) ->
   IO r
-withProcess Config {arguments, foreground, name} stdin k =
+withProcess Spec {arguments, foreground, name} stdin k =
   withPipe \stdinR stdinW ->
     withPipe \stdoutR stdoutW ->
       withPipe \stderrR stderrW -> do
