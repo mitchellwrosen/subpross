@@ -1,28 +1,24 @@
-{-# LANGUAGE UnboxedTuples #-}
-
 module Subpross
   ( withProcess,
     Spec (..),
-    Event (..),
+    Process (..),
+    Stream,
   )
 where
 
-import Control.Concurrent.STM.TQueue
-import Control.Exception (IOException, bracket, try)
-import Control.Monad.STM (atomically)
+import Control.Applicative
+import Control.Concurrent.STM
+import Control.Exception (IOException, bracket, finally, throwIO, try)
+import Control.Foldl (FoldM (..))
+import qualified Control.Foldl as Foldl
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
-import Data.Function
 import Data.Functor (void)
-import Data.IORef
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Void (Void)
-import Event
 import H
 import qualified Ki
-import Pipe (Pipe)
-import qualified Pipe
+import System.Exit
 import qualified System.Posix.Process as Posix (getProcessGroupIDOf)
 import qualified System.Posix.Signals as Posix
 import qualified System.Posix.Types as Posix (CPid)
@@ -30,19 +26,24 @@ import qualified System.Process as Process
 import qualified System.Process.Internals as Process
 import Prelude hiding (lines)
 
+data Process = Process
+  { stdin :: Stream ByteString -> IO (),
+    stdout :: Stream ByteString,
+    stderr :: Stream ByteString,
+    exitCode :: IO ExitCode
+  }
+
 -- TODO cwd, env
 data Spec = Spec
   { name :: Text,
-    arguments :: [Text],
-    foreground :: Bool
+    arguments :: [Text]
   }
 
-withProcess ::
-  Spec ->
-  Pipe Void ByteString ->
-  (Pipe Void (Event ByteString ByteString) -> IO r) ->
-  IO r
-withProcess Spec {arguments, foreground, name} stdin k =
+type Stream a =
+  forall r. FoldM IO a r -> IO r
+
+withProcess :: Spec -> (Process -> IO r) -> IO r
+withProcess Spec {arguments, name} k = do
   withPipe \stdinR stdinW ->
     withPipe \stdoutR stdoutW ->
       withPipe \stderrR stderrW -> do
@@ -53,10 +54,10 @@ withProcess Spec {arguments, foreground, name} stdin k =
                   Process.child_user = Nothing,
                   Process.close_fds = True,
                   Process.cmdspec = Process.RawCommand (Text.unpack name) (map Text.unpack arguments),
-                  Process.create_group = not foreground,
+                  Process.create_group = True,
                   Process.create_new_console = False,
                   Process.cwd = Nothing,
-                  Process.delegate_ctlc = foreground,
+                  Process.delegate_ctlc = False,
                   Process.detach_console = False,
                   Process.env = Nothing,
                   Process.new_session = False,
@@ -68,59 +69,61 @@ withProcess Spec {arguments, foreground, name} stdin k =
         bracket
           (fourth <$> Process.createProcess createProcess)
           terminateProcess
-          (handleProcess stdin k stdinW stdoutR stderrR)
+          \processHandle -> do
+            hClose stdinR
+            hClose stdoutW
+            hClose stderrW
+            Ki.scoped \scope -> do
+              exitCodeThread <- Ki.async scope (Process.waitForProcess processHandle)
+              let -- Is the process still running?
+                  running :: STM Bool
+                  running =
+                    False <$ Ki.awaitSTM exitCodeThread <|> pure True
+              k
+                Process
+                  { stdin =
+                      \stream -> do
+                        -- Minor optimization: don't bother spawning a thread to write stdin if the process has already
+                        -- finished.
+                        atomically running >>= \case
+                          False -> pure ()
+                          True -> do
+                            Ki.scoped \scope2 -> do
+                              -- Consume the stream in a background thread by forwarding all bytes to the stin handle of
+                              -- the subprocess. Ignore exceptions, because they seem uninteresting and race-conditiony
+                              -- since the subprocess can end at any time, before we've written the entire stdin stream
+                              -- (which may be infinite!).
+                              _ <-
+                                Ki.async scope2 do
+                                  stream (Foldl.mapM_ (hWrite stdinW))
+                                  hClose stdinW
+                              -- Once the process has exited, we can (forcefully) stop trying to write to its stdin.
+                              atomically do
+                                running >>= \case
+                                  False -> pure ()
+                                  True -> retry,
+                    stdout = handleStream stdoutR,
+                    stderr = handleStream stderrR,
+                    exitCode = Ki.await exitCodeThread >>= either throwIO pure
+                  }
   where
     fourth :: (a, b, c, d) -> d
     fourth (_, _, _, x) =
       x
 
-handleProcess ::
-  Pipe Void ByteString ->
-  (Pipe Void (Event ByteString ByteString) -> IO r) ->
-  H "w" ->
-  H "r" ->
-  H "r" ->
-  Process.ProcessHandle ->
-  IO r
-handleProcess stdin k stdinW stdoutR stderrR process = do
-  eventQueue <- newTQueueIO
-  let write = atomically . writeTQueue eventQueue
-  Ki.scoped \scope -> do
-    Ki.fork_ scope (handleInput stdinW)
-    Ki.fork_ scope (handleOutput stdoutR (write . Stdout))
-    Ki.fork_ scope (handleOutput stderrR (write . Stderr))
-    Ki.fork_ scope (Process.waitForProcess process >>= write . Exit)
-    k \callback _ ->
-      fix \again -> do
-        event <- atomically (readTQueue eventQueue)
-        callback (Just event)
-        case event of
-          Stdout _ -> again
-          Stderr _ -> again
-          Exit _ -> callback Nothing
-  where
-    handleInput :: H "w" -> IO ()
-    handleInput handle = do
-      alive <- newIORef True
-      let write :: ByteString -> IO ()
-          write bytes =
-            readIORef alive >>= \case
-              False -> pure ()
-              True ->
-                try (hWrite handle bytes) >>= \case
-                  Left (_ :: IOException) -> writeIORef alive False
-                  Right () -> pure ()
-      Pipe.run (stdin . Pipe.traverse_ write)
-      hClose handle
-    handleOutput :: H "r" -> (ByteString -> IO ()) -> IO ()
-    handleOutput handle action =
-      fix \again -> do
-        chunk <- hRead handle
-        if ByteString.null chunk
-          then hClose handle
-          else do
-            action chunk
-            again
+handleStream :: H "r" -> Stream ByteString
+handleStream handle =
+  Foldl.impurely \step initial final -> do
+    acc0 <- initial
+    let loop acc = do
+          chunk <- hRead handle
+          if ByteString.null chunk
+            then do
+              hClose handle
+              pure acc
+            else step acc chunk >>= loop
+    result <- loop acc0
+    final result
 
 terminateProcess :: Process.ProcessHandle -> IO ()
 terminateProcess process =

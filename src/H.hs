@@ -1,7 +1,7 @@
 -- | Handle utils
 module H where
 
-import Control.Exception (bracket, finally)
+import Control.Exception (IOException, catch, onException, uninterruptibleMask)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Coerce (coerce)
@@ -15,8 +15,12 @@ newtype H (s :: Symbol) = H
   {unH :: Handle}
 
 hClose :: H s -> IO ()
-hClose =
-  coerce IO.hClose
+hClose (H handle) =
+  IO.hClose handle `catch` \(_ :: IOException) -> pure ()
+
+hSetBuffering :: H s -> IO.BufferMode -> IO ()
+hSetBuffering =
+  coerce IO.hSetBuffering
 
 hRead :: H "r" -> IO ByteString
 hRead (H handle) =
@@ -27,8 +31,12 @@ hWrite =
   coerce ByteString.hPut
 
 withPipe :: (H "r" -> H "w" -> IO r) -> IO r
-withPipe action =
-  bracket
-    (coerce Process.createPipe)
-    (\(read, write) -> hClose read `finally` hClose write)
-    (uncurry action)
+withPipe action = do
+  uninterruptibleMask \restore -> do
+    (read, write) <- coerce Process.createPipe
+    let cleanup = do
+          hClose read
+          hClose write
+    result <- restore (action read write) `onException` cleanup
+    cleanup
+    pure result

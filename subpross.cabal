@@ -8,6 +8,7 @@ library
   build-depends:
     base,
     bytestring,
+    foldl,
     ki,
     process,
     stm,
@@ -23,6 +24,7 @@ library
     LambdaCase
     NamedFieldPuns
     OverloadedStrings
+    RankNTypes
     ScopedTypeVariables
     TupleSections
     TypeApplications
